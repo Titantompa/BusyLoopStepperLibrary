@@ -8,7 +8,8 @@ namespace BusyLoopStepper
         STEP_IDLE = 0,     // No movement nor processing, step pin is low and direction pin holds it's last state
         STEP_PULSING = 1,  // While in this state the step pulse is high, this should be held for a minimum configurable time to ensure that the step is registered by the driver
         STEP_RUNNING = 2,  // While in this state the step pulse is low, the length of this period dictates the speed at which the stepper is running
-        STEP_REVERSING = 3 // Switching between forward and reverse direction, need to wait for the driver to settle before sending pulses
+        STEP_REVERSING = 3, // Switching between forward and reverse direction, need to wait for the driver to settle before sending pulses
+        STEP_EBRAKE // Stop the stepper as quickly as possible, stepper is idle after decellerating to a halt even though stepper might stop sooner or later!
     } StepperState;
 
     /**
@@ -152,6 +153,16 @@ namespace BusyLoopStepper
         }
 
         /**
+         * @brief Get the current position of the stepper. 
+         * @warning When the stepper is not idle this is a volatile value that may have changed even before this call returns.
+         * @return The current position of the stepper (volatile)
+         */
+        int32_t get_position() const
+        {
+            return currentPosition;
+        }
+
+        /**
          * @brief Set the stepper accelleration
          * This is using the formula for constant accelleration, s = ut + 0.5at^2, which simplifies to s = 0.5at^2 when starting from rest. Solving for t gives us t = sqrt(2s/a) (or even
          * simpler t = sqrt(2/a) since the steps to travel is always one) which is the formula used to calculate the first step duration.
@@ -162,12 +173,25 @@ namespace BusyLoopStepper
             assert(inAccelleration > 0); // Accelleration must be greater than 0 to avoid division by zero and negative accelleration which is not supported in this implementation
             assert(state == STEP_IDLE);  // Only allow changing accelleration when the stepper is idle, otherwise we would need to handle the state transitions and timing differently
 
-            this->accelleration = inAccelleration;
+            accelleration = inAccelleration;
 
             // calculate the duration of the first step in timer ticks, this is used to calculate the initial speed when starting the stepper motor
             firstStepDuration = ceill(sqrt(2.0l / accelleration) * (long double)CLOCK_FREQUENCY);
 
             // Serial.println("Acc: " + String(inAccelleration) + " sps2, " + String(firstStepDuration) + " clk");
+        }
+
+        /**
+         * @brief Set the minimum pulse duration for the step pulses.
+         * 
+         * @param duration The minimum pulse duration in microseconds
+         */
+
+        void set_stepper_min_pulse_duration(int32_t duration)
+        {
+            assert(duration < 1000); // Just to have some sane value
+
+            pulseDuration = (CLOCK_FREQUENCY/1000000)*duration;
         }
 
         /**
@@ -190,6 +214,52 @@ namespace BusyLoopStepper
 
             // Start the stepper
             state = STEP_RUNNING;
+        }
+
+        /**
+         * @brief Stop the stepper as quickly as possible
+         * 
+         * @todo There is a race condition here with the stepper engine task, risking that the stepper goes to the idle state immediately
+         * 
+         * @warning The stepper is idle for as long as it would take to decellerate to a stop. But it is unknown if the stepper has already stopped or
+         * is still moving at that point.
+         * @warning Since there is no way to measure how far the stepper motor travels before coming to a stop, the position of the stepper will be unknown
+         */
+        void emergency_brake()
+        {
+            float stepsPerSecond = (float)CLOCK_FREQUENCY/(float)currentSpeed;
+            float decelleration = (float)CLOCK_FREQUENCY/(float)accelleration;
+            uint32_t timeToStop = (stepsPerSecond/decelleration)*CLOCK_FREQUENCY;
+
+            state = STEP_EBRAKE;
+            startTime = ESP.getCycleCount();
+            delay = timeToStop;
+            currentSpeed = 0;
+            remainingSteps = 0;
+        }
+
+        /**
+         * @brief Move the stepper motor to a specific position (measured in steps).
+         * @note This will do task delays to allow for direction changes!
+         *
+         * @param position The target position, expressed in steps relative to the 0 position.
+         * 
+         * @return The number of steps that will be taken to reach the position
+         */
+        uint32_t goto_absolute(int32_t position)
+        {
+            assert(state == STEP_IDLE); // Only allow starting a movement when the stepper is idle, otherwise we would need to handle the state transitions and timing differently
+
+            if(currentPosition != position)
+            {
+                int32_t relative = currentPosition - position;
+
+                goto_relative(relative);
+
+                return labs(relative);
+            }
+
+            return 0;
         }
 
         /**
@@ -285,13 +355,16 @@ namespace BusyLoopStepper
                     // uint32_t phaseStart = ESP.getCycleCount();
 
                     // Only process the stepper if it is pulsing or running, if it is idle or reversing we don't need to do anything in the timer interrupt
-                    if (stepper.state == STEP_PULSING || stepper.state == STEP_RUNNING)
+                    if (stepper.state == STEP_PULSING || stepper.state == STEP_RUNNING || stepper.state == STEP_EBRAKE)
                     {
                         // Only process the stepper when it's time
                         if (ESP.getCycleCount() - stepper.startTime >= stepper.delay)
                         {
                             switch (stepper.state)
                             {
+                            case STEP_EBRAKE:
+                                stepper.state = STEP_IDLE;
+                                break;
                             case STEP_PULSING:
                                 gpio_set_level((gpio_num_t)stepper.stepPin, LOW);
 
