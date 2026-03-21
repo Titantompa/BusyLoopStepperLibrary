@@ -26,7 +26,7 @@ namespace BusyLoopStepper
             : startTime(0),
               delay(0),
               state(STEP_IDLE),
-              direction(1),
+              direction(0), // uninitialized
               stepPin(gpio_num_t::GPIO_NUM_NC),
               dirPin(gpio_num_t::GPIO_NUM_NC),
               currentSpeed(0),
@@ -208,34 +208,12 @@ namespace BusyLoopStepper
             set_stepper_direction(steps > 0);
 
             remainingSteps = abs(steps);
-            startTime = ESP.getCycleCount();
+            startTime = 0;
             delay = 0;
             currentSpeed = 0;
 
             // Start the stepper
             state = STEP_RUNNING;
-        }
-
-        /**
-         * @brief Stop the stepper as quickly as possible
-         * 
-         * @todo There is a race condition here with the stepper engine task, risking that the stepper goes to the idle state immediately
-         * 
-         * @warning The stepper is idle for as long as it would take to decellerate to a stop. But it is unknown if the stepper has already stopped or
-         * is still moving at that point.
-         * @warning Since there is no way to measure how far the stepper motor travels before coming to a stop, the position of the stepper will be unknown
-         */
-        void emergency_brake()
-        {
-            float stepsPerSecond = (float)CLOCK_FREQUENCY/(float)currentSpeed;
-            float decelleration = (float)CLOCK_FREQUENCY/(float)accelleration;
-            uint32_t timeToStop = (stepsPerSecond/decelleration)*CLOCK_FREQUENCY;
-
-            state = STEP_EBRAKE;
-            startTime = ESP.getCycleCount();
-            delay = timeToStop;
-            currentSpeed = 0;
-            remainingSteps = 0;
         }
 
         /**
@@ -252,7 +230,7 @@ namespace BusyLoopStepper
 
             if(currentPosition != position)
             {
-                int32_t relative = currentPosition - position;
+                int32_t relative = position - currentPosition;
 
                 goto_relative(relative);
 
@@ -260,6 +238,25 @@ namespace BusyLoopStepper
             }
 
             return 0;
+        }
+
+        /**
+         * @brief Stop the stepper as quickly as possible
+         * 
+         * @todo There is a race condition here with the stepper engine task, risking that the stepper goes to the idle state immediately
+         * 
+         * @warning The stepper is idle for as long as it would take to decellerate to a stop. But it is unknown if the stepper has already stopped or
+         * is still moving at that point.
+         * @warning Since there is no way to measure how far the stepper motor travels before coming to a stop, the position of the stepper will be unknown
+         */
+        void emergency_brake()
+        {
+            assert(state != STEP_IDLE); // Only allow braking when the stepper is running
+
+            // Set the state
+            state = STEP_EBRAKE;
+            // Schedule it immediately
+            delay = 0;
         }
 
         /**
@@ -272,20 +269,14 @@ namespace BusyLoopStepper
         {
             assert(state == STEP_IDLE); // Only allow changing direction when the stepper is idle, otherwise we would need to handle the state transitions and timing differently
 
-            vTaskDelay(reverseDelay); // wait for the driver to settle after changing direction
+            uint32_t newDirection = forward ? 1 : -1;
 
-            if (forward)
+            if(newDirection != direction)
             {
-                gpio_set_level((gpio_num_t)dirPin, HIGH);
-                direction = 1;
+                gpio_set_level((gpio_num_t)dirPin, forward ? HIGH : LOW);
+                direction = newDirection;
+                vTaskDelay(reverseDelay); // wait for the driver to settle after changing direction
             }
-            else
-            {
-                gpio_set_level((gpio_num_t)dirPin, LOW);
-                direction = -1;
-            }
-
-            vTaskDelay(reverseDelay); // wait for the driver to settle after changing direction
         }
     };
 
@@ -363,7 +354,20 @@ namespace BusyLoopStepper
                             switch (stepper.state)
                             {
                             case STEP_EBRAKE:
-                                stepper.state = STEP_IDLE;
+                                gpio_set_level((gpio_num_t)stepper.stepPin, LOW);
+                                if(stepper.remainingSteps > 0)
+                                {
+                                    // Decellerate to stop as quickly as possible, using the accelleration value to calculate the speed at which to decellerate
+                                    float stepsPerSecond = (float)CLOCK_FREQUENCY / (float)stepper.currentSpeed;
+                                    float timeToStop = stepsPerSecond / (float)stepper.accelleration;
+
+                                    // Setting the remaining steps will cause the stepper to stop being processed once it is scheduled for the next step
+                                    stepper.remainingSteps = 0;
+                                    stepper.delay = timeToStop * CLOCK_FREQUENCY;
+
+                                    // Allow it to continue being active for the duration of the decelleration
+                                    stepper.state = STEP_RUNNING;
+                                }
                                 break;
                             case STEP_PULSING:
                                 gpio_set_level((gpio_num_t)stepper.stepPin, LOW);
@@ -457,6 +461,7 @@ namespace BusyLoopStepper
                                 }
                                 else
                                 {
+                                    gpio_set_level((gpio_num_t)stepper.dirPin, stepper.direction == 1 ? HIGH : LOW);
                                     gpio_set_level((gpio_num_t)stepper.stepPin, HIGH);
                                     stepper.startTime = ESP.getCycleCount();
                                     stepper.delay = stepper.pulseDuration;
