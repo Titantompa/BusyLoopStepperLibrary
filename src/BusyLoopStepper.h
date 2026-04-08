@@ -207,7 +207,7 @@ namespace BusyLoopStepper
 
             set_stepper_direction(steps > 0);
 
-            remainingSteps = abs(steps);
+            remainingSteps = labs(steps);
             startTime = 0;
             delay = 0;
             currentSpeed = 0;
@@ -251,8 +251,6 @@ namespace BusyLoopStepper
          */
         void emergency_brake()
         {
-            assert(state != STEP_IDLE); // Only allow braking when the stepper is running
-
             // Set the state
             state = STEP_EBRAKE;
             // Schedule it immediately
@@ -311,6 +309,17 @@ namespace BusyLoopStepper
             }
         }
 
+        inline void emergencyBrake()
+        {
+            for (int i = 0; i < NUM_STEPPERS; i++)
+            {
+                if(!_stepperData[i].is_idle())
+                {
+                    _stepperData[i].emergency_brake();
+                }
+            }
+        }
+
         /**
          * @brief
          * The speed of the stepper is determined in the following order:
@@ -355,18 +364,23 @@ namespace BusyLoopStepper
                             {
                             case STEP_EBRAKE:
                                 gpio_set_level((gpio_num_t)stepper.stepPin, LOW);
-                                if(stepper.remainingSteps > 0)
+                                if(stepper.remainingSteps == 0)
                                 {
-                                    // Decellerate to stop as quickly as possible, using the accelleration value to calculate the speed at which to decellerate
+                                    // If already stoppped, then just go idle
+                                    stepper.state = STEP_IDLE;
+                                }
+                                else
+                                {
+                                    // Calculate how long it would take to decellerate from the current speed
                                     float stepsPerSecond = (float)CLOCK_FREQUENCY / (float)stepper.currentSpeed;
                                     float timeToStop = stepsPerSecond / (float)stepper.accelleration;
 
-                                    // Setting the remaining steps will cause the stepper to stop being processed once it is scheduled for the next step
+                                    // Make the stepper continue being active for however long it would take to brake with decelleration
+                                    stepper.state = STEP_RUNNING;
+
+                                    // Clearing the remaining steps will cause the stepper to stop being processed once it is scheduled for the next step
                                     stepper.remainingSteps = 0;
                                     stepper.delay = timeToStop * CLOCK_FREQUENCY;
-
-                                    // Allow it to continue being active for the duration of the decelleration
-                                    stepper.state = STEP_RUNNING;
                                 }
                                 break;
                             case STEP_PULSING:
